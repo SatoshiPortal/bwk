@@ -53,7 +53,6 @@ use {
     miniscript::{psbt::PsbtExt, Descriptor, DescriptorPublicKey},
     std::{
         collections::{BTreeMap, BTreeSet},
-        str::FromStr,
         sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
         thread::{self, JoinHandle},
     },
@@ -82,6 +81,8 @@ pub enum AccountError {
     MissingBlindbitUrl,
     #[error("invalid mnemonic: {0}")]
     InvalidMnemonic(bip39::Error),
+    #[error("config error: {0}")]
+    Config(config::ConfigError),
     #[error("invalid sub-account mnemonic: {0}")]
     SubAccountMnemonic(bwk_sign::error::Error),
     #[error("invalid scan_sk hex: {0}")]
@@ -609,7 +610,7 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         scan_runtime: ScanRuntimeConfig,
     ) -> Result<Self, AccountError> {
         // Validate config
-        if config.mnemonic.is_none() && config.scan_sk.is_none() {
+        if config.mnemonic.is_none() && config.seed.is_none() && config.scan_sk.is_none() {
             return Err(AccountError::MissingKeys);
         }
         if config.blindbit_url.is_empty() {
@@ -632,9 +633,10 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
 
         // One scanner per configured sub-account descriptor, all reporting on
         // this account's channel, plus the signers they cannot hold themselves.
-        // In memory: every sub-signer is re-derivable from a mnemonic the
-        // persisted config already carries.
+        // In memory: every sub-signer is re-derivable from the seed or the
+        // mnemonic the config is constructed with.
         let mut signing_manager = SigningManager::new();
+        let account_seed = config.signing_seed().map_err(AccountError::Config)?;
         let mut scanners = Vec::with_capacity(config.descriptors.len());
         for (i, sub_cfg) in config.descriptors.iter().enumerate() {
             let name = format!("{}-sub-{}", config.account_name, i);
@@ -659,11 +661,17 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
                 kind: SubAccountKind::from(&sub_cfg.descriptor),
             });
             scanners.push(scanner);
-            if let Some(mnemonic) = sub_cfg.mnemonic.clone().or_else(|| config.mnemonic.clone()) {
+            let sub_seed = match &sub_cfg.mnemonic {
+                Some(mnemonic) => Some(
+                    config::mnemonic_seed(mnemonic).map_err(AccountError::SubAccountMnemonic)?,
+                ),
+                None => account_seed.clone(),
+            };
+            if let Some(sub_seed) = sub_seed {
                 register_sub_signer(
                     &mut signing_manager,
                     config.network,
-                    &mnemonic,
+                    &sub_seed,
                     sub_cfg.descriptor.clone(),
                 )?;
             }
@@ -760,6 +768,20 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
         Self::new(config)
     }
 
+    /// Create account from the 64 bytes of a BIP39 seed, whatever the
+    /// mnemonic's language and passphrase.
+    pub fn from_seed(
+        account_name: String,
+        network: Network,
+        seed: &[u8],
+        blindbit_url: String,
+        data_dir: std::path::PathBuf,
+    ) -> Result<Self, AccountError> {
+        let config = Config::from_seed(account_name, network, seed, blindbit_url, data_dir)
+            .map_err(AccountError::Config)?;
+        Self::new(config)
+    }
+
     /// Load an existing Account from configuration.
     ///
     /// Same as `new()` but prioritizes loading existing data from files.
@@ -771,7 +793,14 @@ impl Account<crate::profile::SpRamProfile<bwk::bwk_electrum::profile::DefaultBac
 
     /// Create SpReceiver from config.
     fn create_sp_receiver(config: &Config) -> Result<SpReceiver, AccountError> {
-        if let Some(ref mnemonic) = config.mnemonic {
+        if let Some(seed) = &config.seed {
+            SpReceiver::new_from_seed(
+                seed,
+                config.network,
+                bitcoin::bip32::ChildNumber::from_hardened_idx(0).expect("zero"),
+            )
+            .map_err(AccountError::SpReceiver)
+        } else if let Some(ref mnemonic) = config.mnemonic {
             let mnemonic =
                 bip39::Mnemonic::parse(mnemonic).map_err(AccountError::InvalidMnemonic)?;
             SpReceiver::new_from_mnemonic(mnemonic, config.network)
@@ -1022,10 +1051,12 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
             return Err(AccountError::HeaderScannerMismatch);
         }
         if let Some(mnemonic) = mnemonic {
+            let seed =
+                config::mnemonic_seed(&mnemonic).map_err(AccountError::SubAccountMnemonic)?;
             register_sub_signer(
                 &mut self.signing_manager,
                 self.config.network,
-                &mnemonic,
+                &seed,
                 scanner.descriptor(),
             )?;
         }
@@ -1100,10 +1131,8 @@ impl<P: crate::profile::SpStorageProfile> Account<P> {
     pub(crate) fn sp_master_xpriv(
         &self,
     ) -> Option<(bitcoin::bip32::Fingerprint, bitcoin::bip32::Xpriv)> {
-        let mnemonic_str = self.config.mnemonic.as_ref()?;
-        let mnemonic = bip39::Mnemonic::from_str(mnemonic_str).ok()?;
-        let seed = mnemonic.to_seed("");
-        let xpriv = bitcoin::bip32::Xpriv::new_master(self.config.network, &seed).ok()?;
+        let seed = self.config.signing_seed().ok()??;
+        let xpriv = seed.master_xpriv(self.config.network).ok()?;
         let secp = Secp256k1::new();
         let fg = xpriv.fingerprint(&secp);
         Some((fg, xpriv))
@@ -1787,11 +1816,10 @@ fn header_store_target<'a>(
 fn register_sub_signer(
     signing_manager: &mut SigningManager,
     network: Network,
-    mnemonic: &str,
+    seed: &crate::seed::Seed,
     descriptor: Descriptor<DescriptorPublicKey>,
 ) -> Result<(), AccountError> {
-    let signer = bwk_sign::hot_signer::HotSigner::new_from_mnemonics(network, mnemonic)
-        .map_err(AccountError::SubAccountMnemonic)?;
+    let signer = config::hot_signer(network, seed).map_err(AccountError::Config)?;
     if !signing_manager.has_bip32_signer(&signer.fingerprint()) {
         signing_manager.add_bip32_signer(signer);
     }
@@ -2031,7 +2059,12 @@ mod tests {
     /// A taproot sub-account holding one unconfirmed 0.5 BTC coin, as the
     /// scanner records a receive the server reported in the mempool.
     fn account_with_an_unconfirmed_taproot_coin() -> Account {
-        let mut config = test_config();
+        with_an_unconfirmed_taproot_coin(test_config())
+    }
+
+    /// The account of `config`, with a taproot sub-account holding one
+    /// unconfirmed 0.5 BTC coin.
+    fn with_an_unconfirmed_taproot_coin(mut config: Config) -> Account {
         config.add_default_taproot_sub_account().unwrap();
         let mut account = Account::new(config).unwrap();
         let scanner = account.scanners_mut().next().unwrap();
@@ -3228,6 +3261,128 @@ mod tests {
 
         assert!(matches!(err, AccountError::MissingPrevout(outpoint) if outpoint == foreign));
         assert!(psbt.inputs[0].tap_key_sig.is_none());
+    }
+    // Built from seed bytes
+
+    fn words() -> bip39::Mnemonic {
+        <bip39::Mnemonic as std::str::FromStr>::from_str(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+             abandon about",
+        )
+        .unwrap()
+    }
+
+    /// The same entropy as `words`, in the French wordlist.
+    fn french() -> bip39::Mnemonic {
+        bip39::Mnemonic::from_entropy_in(bip39::Language::French, &words().to_entropy()).unwrap()
+    }
+
+    fn seed_config(seed: &[u8]) -> Config {
+        Config::from_seed(
+            "test-account".to_string(),
+            Network::Signet,
+            seed,
+            "https://blindbit.example.com".to_string(),
+            PathBuf::from("/tmp/bwk-sp-account-test"),
+        )
+        .unwrap()
+        .with_persistence(None)
+    }
+
+    /// Spends the account's taproot coin to its own SP address and records
+    /// the spend; returns how many of its outputs the account found as its
+    /// own.
+    fn self_send(account: &Account) -> (usize, usize) {
+        let mut builder = account.tx_builder().feerate(1000);
+        builder.send_to_sp(account.sp_address(), 100_000);
+        for coin in builder.select_coins(100_000, 1000) {
+            builder.add_input(coin);
+        }
+        let mut psbt = builder.generate().unwrap();
+        let tx = account.sign_and_finalize(&mut psbt).unwrap();
+        let txid = account.record_unconfirmed_spend(&tx).unwrap();
+        let own = account
+            .coins()
+            .into_values()
+            .filter(|entry| entry.outpoint().txid == txid)
+            .count();
+        (own, tx.output.len())
+    }
+
+    #[test]
+    fn english_seed_account_matches_the_mnemonic_account() {
+        let from_words = with_an_unconfirmed_taproot_coin(test_config());
+        let from_seed = with_an_unconfirmed_taproot_coin(seed_config(&words().to_seed("")));
+
+        assert_eq!(from_seed.sp_address(), from_words.sp_address());
+        // What the words derive, as on signing_rework.
+        assert_eq!(
+            from_seed.sp_address().to_string(),
+            "tsp1qqdpels3srq45dlezqvk20t3dlueftry6p5thc7msjm0s6jm3g84jzq5rxzzunfck6d45va2jcqxk42\
+             9agt3e4klf3vzmcgp3zqthryhhqgnz4k3n"
+        );
+        assert_eq!(
+            from_seed.sp_receiver.try_get_secret_spend_key().unwrap(),
+            from_words.sp_receiver.try_get_secret_spend_key().unwrap()
+        );
+        assert_eq!(
+            from_seed.get_config().descriptors[0].descriptor.to_string(),
+            from_words.get_config().descriptors[0]
+                .descriptor
+                .to_string()
+        );
+        assert_eq!(from_seed.master_xprivs(), from_words.master_xprivs());
+        assert!(from_seed.can_sign());
+    }
+
+    #[test]
+    fn english_seed_account_spends_and_finds_its_change() {
+        let account = with_an_unconfirmed_taproot_coin(seed_config(&words().to_seed("")));
+        let (own, outputs) = self_send(&account);
+        assert_eq!(own, outputs);
+    }
+
+    #[test]
+    fn a_passphrase_changes_the_account() {
+        let plain = Account::new(seed_config(&words().to_seed(""))).unwrap();
+        let with_passphrase = Account::new(seed_config(&words().to_seed("TREZOR"))).unwrap();
+        assert_ne!(with_passphrase.sp_address(), plain.sp_address());
+        assert_ne!(
+            with_passphrase.master_xprivs().keys().collect::<Vec<_>>(),
+            plain.master_xprivs().keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_french_seed_account_spends_and_finds_its_change() {
+        let english = Account::new(seed_config(&words().to_seed(""))).unwrap();
+        let account = with_an_unconfirmed_taproot_coin(seed_config(&french().to_seed("")));
+        assert_ne!(account.sp_address(), english.sp_address());
+
+        let (own, outputs) = self_send(&account);
+        assert_eq!(own, outputs);
+    }
+
+    #[test]
+    fn from_seed_refuses_a_wrong_length() {
+        for len in [0, 32, 63, 65] {
+            let result = Account::from_seed(
+                "test-account".to_string(),
+                Network::Signet,
+                &vec![7u8; len],
+                "https://blindbit.example.com".to_string(),
+                PathBuf::from("/tmp/bwk-sp-test-from-seed"),
+            );
+            let Err(err) = result else {
+                panic!("expected an error");
+            };
+            assert!(matches!(
+                err,
+                AccountError::Config(config::ConfigError::Seed(
+                    crate::receiver::error::Error::SeedLength(l)
+                )) if l == len
+            ));
+        }
     }
 }
 

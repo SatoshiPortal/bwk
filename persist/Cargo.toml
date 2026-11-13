@@ -6,6 +6,7 @@ documentation = "https://docs.rs/bwk-persist"
 readme.workspace = true
 license-file.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 
@@ -15,7 +16,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true
 fs2 = "0.4"
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rusqlite = { version = "0.42", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 temp-dir.workspace = true

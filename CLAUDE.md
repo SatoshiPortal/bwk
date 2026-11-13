@@ -30,7 +30,7 @@ scripts/ci-checks.sh clippy
 cargo fmt -- --check
 ```
 
-MSRV: 1.88
+MSRV: 1.89 (required by rusqlite 0.42 when using the SQLite backend)
 
 **Before committing:** Ensure CI will pass by running clippy, fmt check, and
 tests locally. Commit messages must be single-line and follow existing style

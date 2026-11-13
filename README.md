@@ -84,4 +84,4 @@ scripts/ci-checks.sh tests
 scripts/ci-checks.sh clippy
 ```
 
-MSRV: 1.88
+MSRV: 1.89 (required by rusqlite 0.42 when using the SQLite backend)

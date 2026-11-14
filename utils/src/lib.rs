@@ -366,7 +366,7 @@ pub fn android_root_certs() -> io::Result<Vec<Vec<u8>>> {
 
 pub fn short_string(s: String, len: usize) -> String {
     assert!(len > 6);
-    let separator = if len % 2 != 0 { "." } else { ".." };
+    let separator = if !len.is_multiple_of(2) { "." } else { ".." };
     let head = (len - 2).div_ceil(2);
     let tail = head;
     if s.len() <= head + tail + 2 {

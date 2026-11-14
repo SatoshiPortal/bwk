@@ -30,7 +30,9 @@ scripts/ci-checks.sh clippy
 cargo fmt -- --check
 ```
 
-MSRV: 1.89 (required by rusqlite 0.42 when using the SQLite backend)
+Development and CI use Rust 1.100.0, pinned in `rust-toolchain.toml`. CI also
+checks nightly compatibility. The minimum supported Rust version (MSRV) remains
+1.89, required by rusqlite 0.42 when using the SQLite backend.
 
 **Before committing:** Ensure CI will pass by running clippy, fmt check, and
 tests locally. Commit messages must be single-line and follow existing style
